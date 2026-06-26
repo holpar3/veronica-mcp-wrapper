@@ -1,51 +1,119 @@
 """
-Veronica MCP Wrapper -- phone-reach for the chair (Claude-Veronica)
-===================================================================
-Fronts the existing OneDrive bridge (OpenAPI) with a Model Context Protocol
-server so the Claude app can reach the vault as a custom connector. Thin proxy:
-four MCP tools (list/read/write/search), each forwarding to the matching bridge
-REST endpoint, authenticating to the bridge with the existing BRIDGE_API_KEY.
+Veronica MCP Wrapper v2 -- OAuth layer (read-only phone connector)
+==================================================================
+Phase 3b. Fronts the existing OneDrive bridge with a Model Context Protocol
+server the Claude app can register as a custom connector. v1 (secret-URL, no
+auth) deployed clean but the Claude *Connect* button refuses a no-auth public
+server -- it requires OAuth 2.1. This version adds that, the right way:
 
-Auth model (verified against live Claude docs, 2026-06-25):
-  * Claude's connector UI does NOT support a user-pasted static Bearer token or
-    custom headers -- only OAuth 2.1 (Advanced settings) or NO auth. Static
-    bearer is explicitly unsupported; query-string tokens are prohibited.
-  * Full OAuth 2.1 + PKCE is overkill for a single-user personal vault, so v1
-    uses NO connector-level auth and protects the endpoint with:
-      1. CAPABILITY URL -- the MCP endpoint lives at a secret path segment
-         (WRAPPER_SECRET). The URL is the credential; it lives only in Hollie's
-         connector config + the vault.
-      2. (hardening, optional) IP allowlist to Anthropic's published egress
-         range -- only Anthropic's cloud calls this.
-  * The bridge's BRIDGE_API_KEY still guards Graph access; the wrapper holds it
-    server-side and never exposes it to Claude.
+  * Built on standalone FastMCP v2 (pkg `fastmcp`, gofastmcp.com) -- NOT the
+    base `mcp` SDK's FastMCP. Different package. The auth providers live here.
+  * GoogleProvider = FastMCP's OAuth proxy pointed at Google. Google does the
+    actual "is this Hollie" login; the proxy presents Claude a standards-clean
+    OAuth 2.1 + PKCE face and never hands Claude the upstream Google token
+    (token-factory pattern -- Claude only ever gets a FastMCP-issued JWT).
+
+Posture (Hollie-approved, 25 Jun): swap the lock, don't widen the door.
+  1. READ-ONLY. write_file is dropped. Worst case at this door = someone reads
+     journals, never writes. Writes stay laptop-only (the Mac MCP).
+  2. GOOGLE-DELEGATED login -- the crypto-adjacent parts (PKCE, token issuance,
+     redirect matching) come from FastMCP's vetted proxy, not hand-rolled.
+  3. BATTALION identity gate -- enforced at the Google layer: the OAuth client
+     lives under the Battalion account in "Testing" publishing status with ONLY
+     dinosauronesiebattalion@gmail.com as a test user, so Google blocks every
+     other account at consent. (In-code email allowlist is a future hardening
+     once we can observe the real token claims live; left out of v1 to avoid a
+     fail-closed lockout on an unverified assumption.)
+
+Blast radius, unchanged by OAuth: the vault rides Hollie's PERSONAL OneDrive,
+and the bridge holds Files.ReadWrite to that whole drive. OAuth neither widens
+nor narrows that -- it's a different front-door lock on the same bridge.
+Read-only here is what actually shrinks the worst case at THIS door.
+
+Verified live against fastmcp 3.4.2 (2026-06-26) + sandbox-tested:
+  - module imports clean with full OAuth config;
+  - /.well-known/oauth-authorization-server + .../oauth-protected-resource/mcp
+    serve correct metadata;
+  - unauth POST /mcp -> 401 with WWW-Authenticate carrying resource_metadata
+    (the exact discovery header the no-auth wrapper could not produce -> this
+    is what makes Claude's Connect button start the flow instead of dying);
+  - only list_files/read_file/search_files register (no write_file).
 
 Env vars (Hollie's hands set these on Render):
-  BRIDGE_BASE_URL  -- e.g. https://veronica-onedrive-bridge.onrender.com
-  BRIDGE_API_KEY   -- the SAME long random string already set on the bridge
-  WRAPPER_SECRET   -- a NEW long random string; becomes the secret URL segment
-
-Tested in sandbox 2026-06-25 (mcp 1.28.0): 4 tools register; mounts at
-/<WRAPPER_SECRET>; correct secret path completes the MCP initialize handshake
-(HTTP 200, session created); bare /mcp and a guessed secret both 404.
+  BRIDGE_BASE_URL          existing -- the OneDrive bridge URL (GET /health -> ok)
+  BRIDGE_API_KEY           existing -- same key already on the bridge
+  PUBLIC_URL               this wrapper's own public https URL on Render
+  GOOGLE_CLIENT_ID         from the Battalion Google OAuth client (Web app)
+  GOOGLE_CLIENT_SECRET     "
+  JWT_SIGNING_KEY          a NEW long random string (>=32 chars). Fixed across
+                           restarts so issued tokens stay valid through redeploys.
+  STORAGE_ENCRYPTION_KEY   a Fernet key: python -c "from cryptography.fernet
+                           import Fernet;print(Fernet.generate_key().decode())"
+  STORAGE_DIR              path on the mounted persistent disk, e.g. /data/oauth
 """
 
 import os
-from contextlib import asynccontextmanager
-
 import httpx
-from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.routing import Mount
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.google import GoogleProvider
+from cryptography.fernet import Fernet
+from key_value.aio.stores.disk import DiskStore
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 
+# --- existing bridge wiring (held server-side; never exposed to Claude) ---
 BRIDGE_BASE_URL = os.environ["BRIDGE_BASE_URL"].rstrip("/")
 BRIDGE_API_KEY = os.environ["BRIDGE_API_KEY"]
-WRAPPER_SECRET = os.environ["WRAPPER_SECRET"].strip("/")
-
 _headers = {"Authorization": f"Bearer {BRIDGE_API_KEY}"}
 _TIMEOUT = httpx.Timeout(30.0)
 
-mcp = FastMCP("Veronica Vault")
+# --- OAuth / public config ---
+PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
+GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
+GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
+JWT_SIGNING_KEY = os.environ["JWT_SIGNING_KEY"]
+STORAGE_ENCRYPTION_KEY = os.environ["STORAGE_ENCRYPTION_KEY"]
+STORAGE_DIR = os.environ.get("STORAGE_DIR", "/data/oauth")
+
+# Persistent, encrypted storage for OAuth client registrations + upstream tokens.
+# This is the fix for the widespread "connects, then drops, can't reconnect
+# without removing the connector" bug: on Linux, FastMCP defaults to in-memory
+# storage + ephemeral keys, so every restart invalidates everything. A disk
+# store on a mounted Render disk + a fixed JWT_SIGNING_KEY makes it survive
+# redeploys and recycles. Fernet encrypts the upstream tokens at rest.
+_storage = FernetEncryptionWrapper(
+    key_value=DiskStore(directory=STORAGE_DIR),
+    fernet=Fernet(STORAGE_ENCRYPTION_KEY),
+)
+
+auth = GoogleProvider(
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_CLIENT_SECRET,
+    base_url=PUBLIC_URL,
+    required_scopes=["openid", "https://www.googleapis.com/auth/userinfo.email"],
+    # Exact-match allowlist for the client callback. claude.ai is the live host;
+    # .com included as the documented variant. Defense-in-depth -- the real
+    # identity gate is Google's test-user list.
+    allowed_client_redirect_uris=[
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback",
+    ],
+    client_storage=_storage,
+    jwt_signing_key=JWT_SIGNING_KEY,
+    # One client (the Claude app). Disabling CIMD keeps client_ids as UUIDs
+    # (filesystem-safe for the disk store) and shrinks the attack surface;
+    # also sidesteps the CIMD+disk path bug (fastmcp #3574).
+    enable_cimd=False,
+    # Ask Google for a refresh token so sessions renew without a full re-login.
+    # (In Google "Testing" status these refresh tokens still expire ~7 days, so
+    # expect roughly weekly re-consent -- that's Google policy, not a fault.)
+    extra_authorize_params={"access_type": "offline", "prompt": "consent"},
+    # Decouple the FastMCP token lifetime from Google's short access-token TTL;
+    # the proxy transparently refreshes upstream underneath.
+    fastmcp_access_token_expiry_seconds=60 * 60 * 24 * 7,  # 7 days
+    require_authorization_consent=True,  # confused-deputy defense; keep on
+)
+
+mcp = FastMCP("Veronica Vault", auth=auth)
 
 
 @mcp.tool()
@@ -69,17 +137,6 @@ def read_file(path: str) -> dict:
 
 
 @mcp.tool()
-def write_file(path: str, content: str) -> dict:
-    """Create or overwrite a text file at the given vault path with the provided
-    content. Parent folders are created as needed."""
-    r = httpx.post(f"{BRIDGE_BASE_URL}/write_file",
-                   json={"path": path, "content": content},
-                   headers=_headers, timeout=_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-
-@mcp.tool()
 def search_files(query: str) -> dict:
     """Search the whole vault for files whose name or contents match the query.
     Returns matching file names and their folder paths."""
@@ -89,19 +146,9 @@ def search_files(query: str) -> dict:
     return r.json()
 
 
-# streamable_http_app() must be called BEFORE referencing session_manager
-# (it's created lazily). Build it once, then hand its lifespan to the parent app.
-_mcp_app = mcp.streamable_http_app()
+# write_file intentionally omitted for v1 (read-only phone connector).
+# To restore write later, re-add the tool here and redeploy.
 
-
-@asynccontextmanager
-async def lifespan(app):
-    async with mcp.session_manager.run():
-        yield
-
-
-# Claude connector URL = https://<host>/<WRAPPER_SECRET>/mcp
-app = Starlette(
-    routes=[Mount(f"/{WRAPPER_SECRET}", app=_mcp_app)],
-    lifespan=lifespan,
-)
+# ASGI app for uvicorn (mounts /mcp + all OAuth routes automatically).
+# Connector URL = https://<host>/mcp  (no secret path segment -- OAuth is the gate now).
+app = mcp.http_app()
